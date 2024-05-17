@@ -1,0 +1,126 @@
+-- The purpose of this model is to generate Actual ROAS and Predicted ROAS for all monthly cohorts across all channels, networks, and campaigns to understand marketing efficiency and payback periods
+
+--  The first CTE of the model is used to generate all install details per day, which will be our left most table the model
+WITH installs AS (
+SELECT
+  install_id
+  , DATE(DATE_TRUNC('day',install_at)) AS install_date
+  , is_paid
+  , channel
+  , network
+  , campaign
+FROM installs
+)
+
+--  We'll next generate all cohort signup related data 
+, signups AS (
+SELECT
+  signup_id 
+  , install_id
+  , is_paid
+  , channel
+  , network
+  , campaign
+  , DATE(DATE_TRUNC('day',s.signup_at)) AS signup_date
+FROM signups s
+  LEFT JOIN install_details i 
+    ON s.id = i.customer_id
+)
+
+--  Adding in marketing spend data
+, marketing_spend AS (
+SELECT
+    spend_date
+  , channel
+  , network
+  , campaign
+  , SUM(spend) AS spend_amount
+FROM ad_spend
+WHERE 1=1
+  AND spend > 0
+GROUP BY 1,2,3,4
+)
+
+--  Adding in Payment data for the base ROAS calculations
+, revenue AS (
+SELECT
+    DISTINCT s.id AS payment_id
+  , SUM(CASE WHEN DATEDIFF('day',i.signup_at, p.payment_date) BETWEEN 0 AND 7 THEN p.payment_amount ELSE NULL END) AS all_payments_7d
+  , SUM(CASE WHEN DATEDIFF('day',i.signup_at, p.payment_date) BETWEEN 0 AND 730 THEN p.payment_amount ELSE NULL END) AS all_payments_730d
+FROM signups s
+  INNER JOIN payments p  
+    ON s.id = p.customer_id
+GROUP BY 1
+)
+
+--  We will now also add in the forecasted revenue data so we can see predicted ROAS next to actual ROAS downstream in the BI tool
+, forecasts AS (
+SELECT
+    DISTINCT s.id AS revenue_user_id
+  , DATE(DATE_TRUNC('day',s.signup_at)) AS signup_date
+  , f.month
+  , COALESCE(sum(f.forecasted_payments),0) AS forecasted_payments
+FROM user_forecasts f
+  INNER JOIN signups s
+    ON f.customer_id = s.d
+GROUP BY 1,2,3
+)
+
+-- Now to combine all the relevant CTEs into one dataset
+, combined_data AS (
+SELECT
+    i.install_date AS [date]
+  , i.is_paid
+  , i.channel
+  , i.network
+  , i.campaign
+  , r.month
+  , spend
+  , COUNT(DISTINCT i.install_id) AS install_count
+  , COUNT(DISTINCT s.signup_id) AS signup_count
+  , COUNT(DISTINCT (CASE WHEN p.all_payments_7d IS NOT NULL THEN p.payment_user_id END)) AS payers_within_7d
+  , SUM(r.forecasted_payments) AS forecasted_payments
+FROM installs i
+  LEFT JOIN signups s  
+    ON i.install_id = s.install_id
+    AND i.is_paid = s.is_paid
+    AND i.channel = s.channel
+    AND i.network = s.channel
+    AND i.campaign = s.campaign
+  LEFT JOIN marketing_spend s 
+    ON i.install_date = s.spend_date 
+    AND i.channel  = s.channel 
+    AND i.network = s.network 
+    AND i.campaign = s.campaign
+  LEFT JOIN revenue p 
+    ON u.user_id = p.payment_user_id
+  LEFT JOIN forecasts r 
+    ON r.revenue_user_id = u.user_id
+GROUP BY 1,2,3,4,5,6,7,8
+)
+
+, running_totals AS (
+SELECT
+    [date]
+  , is_paid
+  , channel
+  , network
+  , campaign
+  , month
+  , SUM(forecasted_payments) OVER (PARTITION BY [date], is_paid, channel, network, campaign ORDER BY month ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total
+FROM combined_data
+GROUP BY 1,2,3,4,5,6,forecasted_payments
+)
+
+SELECT
+    f.*
+  , r.running_total
+FROM combined_data c
+  LEFT JOIN running_totals r 
+    ON c.[date] = r.[date] 
+    AND c.is_paid = r.is_paid 
+    AND c.channel = r.channel 
+    AND c.network = r.network 
+    AND c.campaign = r.campaign 
+    AND c.month = r.month
+ORDER BY 1,2,3,4,5,6
